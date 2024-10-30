@@ -129,18 +129,26 @@ static Value GetParquetSchemaParam(vector<IcebergColumnDefinition> &schema) {
 
 //! Build the Parquet Scan expression for the files we need to scan
 static unique_ptr<TableRef> MakeScanExpression(vector<Value> &data_file_values, vector<Value> &delete_file_values,
-                                               vector<IcebergColumnDefinition> &schema, bool allow_moved_paths, string metadata_compression_codec, bool skip_schema_inference) {
+                                               vector<IcebergColumnDefinition> &schema, bool allow_moved_paths,
+                                               string metadata_compression_codec, bool skip_schema_inference,
+                                               int64_t data_cardinality, int64_t delete_cardinality) {
+    
+	auto cardinality = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("explicit_cardinality"),
+	                                                                                  make_uniq<ConstantExpression>(Value(data_cardinality)));
+
 	// No deletes, just return a TableFunctionRef for a parquet scan of the data files
 	if (delete_file_values.empty()) {
 		auto table_function_ref_data = make_uniq<TableFunctionRef>();
 		table_function_ref_data->alias = "iceberg_scan_data";
 		vector<unique_ptr<ParsedExpression>> left_children;
 		left_children.push_back(make_uniq<ConstantExpression>(Value::LIST(data_file_values)));
+		left_children.push_back(std::move(cardinality));
 		if (!skip_schema_inference) {
 			left_children.push_back(
 					make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("schema"),
 					make_uniq<ConstantExpression>(GetParquetSchemaParam(schema))));
 		}
+
 		table_function_ref_data->function = make_uniq<FunctionExpression>("parquet_scan", std::move(left_children));
 		return std::move(table_function_ref_data);
 	}
@@ -165,6 +173,7 @@ static unique_ptr<TableRef> MakeScanExpression(vector<Value> &data_file_values, 
 	table_function_ref_data->alias = "iceberg_scan_data";
 	vector<unique_ptr<ParsedExpression>> left_children;
 	left_children.push_back(make_uniq<ConstantExpression>(Value::LIST(data_file_values)));
+	left_children.push_back(std::move(cardinality));
 	left_children.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
 	                                                        make_uniq<ColumnRefExpression>("filename"),
 	                                                        make_uniq<ConstantExpression>(Value(1))));
@@ -184,6 +193,8 @@ static unique_ptr<TableRef> MakeScanExpression(vector<Value> &data_file_values, 
 	table_function_ref_deletes->alias = "iceberg_scan_deletes";
 	vector<unique_ptr<ParsedExpression>> right_children;
 	right_children.push_back(make_uniq<ConstantExpression>(Value::LIST(delete_file_values)));
+	right_children.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("explicit_cardinality"),
+	                                                                                        make_uniq<ConstantExpression>(Value(delete_cardinality))));
 	table_function_ref_deletes->function = make_uniq<FunctionExpression>("parquet_scan", std::move(right_children));
 	join_node->right = std::move(table_function_ref_deletes);
 
@@ -214,6 +225,8 @@ static unique_ptr<TableRef> IcebergScanBindReplace(ClientContext &context, Table
 	bool skip_schema_inference = false;
 	string mode = "default";
 	string metadata_compression_codec = "none";
+	string table_version = DEFAULT_VERSION_HINT_FILE;
+	string version_name_format = DEFAULT_TABLE_VERSION_FORMAT;
 
 	string catalog_type = "";
 	string catalog = "";
@@ -242,21 +255,26 @@ static unique_ptr<TableRef> IcebergScanBindReplace(ClientContext &context, Table
 			region = StringValue::Get(kv.second);
 		} else if (loption == "database_name") {
 			database_name = StringValue::Get(kv.second);
+		} else if (loption == "version") {
+			table_version = StringValue::Get(kv.second);
+		} else if (loption == "version_name_format") {
+			version_name_format = StringValue::Get(kv.second);
 		}
 	}
 	IcebergSnapshot snapshot_to_scan(catalog_type, catalog, region, database_name);
+	auto iceberg_meta_path = snapshot_to_scan.GetMetaDataPath(iceberg_path, fs, metadata_compression_codec, table_version, version_name_format);
 
 	if (input.inputs.size() > 1) {
 		if (input.inputs[1].type() == LogicalType::UBIGINT) {
-			snapshot_to_scan = snapshot_to_scan.GetSnapshotById(iceberg_path, fs, input.inputs[1].GetValue<uint64_t>(), metadata_compression_codec, skip_schema_inference);
+			snapshot_to_scan = snapshot_to_scan.GetSnapshotById(iceberg_meta_path, fs, input.inputs[1].GetValue<uint64_t>(), metadata_compression_codec, skip_schema_inference);
 		} else if (input.inputs[1].type() == LogicalType::TIMESTAMP) {
 			snapshot_to_scan =
-			    snapshot_to_scan.GetSnapshotByTimestamp(iceberg_path, fs, input.inputs[1].GetValue<timestamp_t>(), metadata_compression_codec, skip_schema_inference);
+			    snapshot_to_scan.GetSnapshotByTimestamp(iceberg_meta_path, fs, input.inputs[1].GetValue<timestamp_t>(), metadata_compression_codec, skip_schema_inference);
 		} else {
 			throw InvalidInputException("Unknown argument type in IcebergScanBindReplace.");
 		}
 	} else {
-		snapshot_to_scan = snapshot_to_scan.GetLatestSnapshot(iceberg_path, fs, metadata_compression_codec, skip_schema_inference);
+		snapshot_to_scan = snapshot_to_scan.GetLatestSnapshot(iceberg_meta_path, fs, metadata_compression_codec, skip_schema_inference);
 	}
 
 	IcebergTable iceberg_table = IcebergTable(iceberg_path, snapshot_to_scan, fs, allow_moved_paths, metadata_compression_codec);
@@ -276,7 +294,19 @@ static unique_ptr<TableRef> IcebergScanBindReplace(ClientContext &context, Table
 	if (mode == "list_files") {
 		return MakeListFilesExpression(data_file_values, delete_file_values);
 	} else if (mode == "default") {
-		return MakeScanExpression(data_file_values, delete_file_values, snapshot_to_scan.schema, allow_moved_paths, metadata_compression_codec, skip_schema_inference);
+		int64_t data_cardinality = 0, delete_cardinality = 0;
+		for(auto &manifest : iceberg_table.entries) {
+			for(auto &entry : manifest.manifest_entries) {
+				if (entry.status != IcebergManifestEntryStatusType::DELETED) {
+					if (entry.content == IcebergManifestEntryContentType::DATA) {
+						data_cardinality += entry.record_count;
+					} else { // DELETES
+						delete_cardinality += entry.record_count;
+					}
+				}
+			}
+		}
+		return MakeScanExpression(data_file_values, delete_file_values, snapshot_to_scan.schema, allow_moved_paths, metadata_compression_codec, skip_schema_inference, data_cardinality, delete_cardinality);
 	} else {
 		throw NotImplementedException("Unknown mode type for ICEBERG_SCAN bind : '" + mode + "'");
 	}
@@ -291,12 +321,12 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction() {
 	fun.named_parameters["allow_moved_paths"] = LogicalType::BOOLEAN;
 	fun.named_parameters["mode"] = LogicalType::VARCHAR;
 	fun.named_parameters["metadata_compression_codec"] = LogicalType::VARCHAR;
-
 	fun.named_parameters["catalog_type"] = LogicalType::VARCHAR;
 	fun.named_parameters["catalog"] = LogicalType::VARCHAR;
 	fun.named_parameters["region"] = LogicalType::VARCHAR;
 	fun.named_parameters["database_name"] = LogicalType::VARCHAR;
-
+	fun.named_parameters["version"] = LogicalType::VARCHAR;
+	fun.named_parameters["version_name_format"] = LogicalType::VARCHAR;
 	function_set.AddFunction(fun);
 
 	fun = TableFunction({LogicalType::VARCHAR, LogicalType::UBIGINT}, nullptr, nullptr,
@@ -311,7 +341,8 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction() {
 	fun.named_parameters["catalog"] = LogicalType::VARCHAR;
 	fun.named_parameters["region"] = LogicalType::VARCHAR;
 	fun.named_parameters["database_name"] = LogicalType::VARCHAR;
-
+	fun.named_parameters["version"] = LogicalType::VARCHAR;
+	fun.named_parameters["version_name_format"] = LogicalType::VARCHAR;
 	function_set.AddFunction(fun);
 
 	fun = TableFunction({LogicalType::VARCHAR, LogicalType::TIMESTAMP}, nullptr, nullptr,
@@ -326,7 +357,8 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction() {
 	fun.named_parameters["catalog"] = LogicalType::VARCHAR;
 	fun.named_parameters["region"] = LogicalType::VARCHAR;
 	fun.named_parameters["database_name"] = LogicalType::VARCHAR;
-
+	fun.named_parameters["version"] = LogicalType::VARCHAR;
+	fun.named_parameters["version_name_format"] = LogicalType::VARCHAR;
 	function_set.AddFunction(fun);
 
 	return function_set;

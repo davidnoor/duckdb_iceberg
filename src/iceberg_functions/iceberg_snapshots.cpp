@@ -13,6 +13,8 @@ struct IcebergSnaphotsBindData : public TableFunctionData {
 	IcebergSnaphotsBindData() {};
 	string filename;
 	string metadata_compression_codec;
+	string table_version;
+	string version_name_format;
 	bool skip_schema_inference = false;
 	string catalog_type = "";
 	string catalog = "";
@@ -35,8 +37,9 @@ public:
 		FileSystem &fs = FileSystem::GetFileSystem(context);
 
 		IcebergSnapshot snapshot(bind_data.catalog_type, bind_data.catalog, bind_data.region, bind_data.database_name);
+		auto iceberg_meta_path = snapshot.GetMetaDataPath(bind_data.filename, fs, bind_data.metadata_compression_codec, bind_data.table_version, bind_data.version_name_format);
 
-		global_state->metadata_file = snapshot.ReadMetaData(bind_data.filename, fs, bind_data.metadata_compression_codec);
+		global_state->metadata_file = snapshot.ReadMetaData(iceberg_meta_path, fs, bind_data.metadata_compression_codec);
 		global_state->metadata_doc =
 		    yyjson_read(global_state->metadata_file.c_str(), global_state->metadata_file.size(), 0);
 		auto root = yyjson_doc_get_root(global_state->metadata_doc);
@@ -57,6 +60,8 @@ static unique_ptr<FunctionData> IcebergSnapshotsBind(ClientContext &context, Tab
 	auto bind_data = make_uniq<IcebergSnaphotsBindData>();
 
 	string metadata_compression_codec = "none";
+	string table_version = DEFAULT_VERSION_HINT_FILE;
+	string version_name_format = DEFAULT_TABLE_VERSION_FORMAT;
 	bool skip_schema_inference = false;
 
 	string catalog_type = "";
@@ -68,6 +73,10 @@ static unique_ptr<FunctionData> IcebergSnapshotsBind(ClientContext &context, Tab
 		auto loption = StringUtil::Lower(kv.first);
 		if (loption == "metadata_compression_codec") {
 			metadata_compression_codec = StringValue::Get(kv.second);
+		} else if (loption == "version") {
+			table_version = StringValue::Get(kv.second);
+		} else if (loption == "version_name_format") {
+			version_name_format = StringValue::Get(kv.second);
 		} else if (loption == "skip_schema_inference") {
 			skip_schema_inference = BooleanValue::Get(kv.second);
 		} else if (loption == "catalog_type") {
@@ -83,6 +92,8 @@ static unique_ptr<FunctionData> IcebergSnapshotsBind(ClientContext &context, Tab
 	bind_data->filename = input.inputs[0].ToString();
 	bind_data->metadata_compression_codec = metadata_compression_codec;
 	bind_data->skip_schema_inference = skip_schema_inference;
+	bind_data->table_version = table_version;
+	bind_data->version_name_format = version_name_format;
 
 	names.emplace_back("sequence_number");
 	return_types.emplace_back(LogicalType::UBIGINT);
@@ -138,6 +149,8 @@ TableFunctionSet IcebergFunctions::GetIcebergSnapshotsFunction() {
 	TableFunction table_function({LogicalType::VARCHAR}, IcebergSnapshotsFunction, IcebergSnapshotsBind,
 	                             IcebergSnapshotGlobalTableFunctionState::Init);
 	table_function.named_parameters["metadata_compression_codec"] = LogicalType::VARCHAR;
+	table_function.named_parameters["version"] = LogicalType::VARCHAR;
+	table_function.named_parameters["version_name_format"] = LogicalType::VARCHAR;
 	table_function.named_parameters["skip_schema_inference"] = LogicalType::BOOLEAN;
 	function_set.AddFunction(table_function);
 	return function_set;

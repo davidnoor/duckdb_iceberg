@@ -12,7 +12,15 @@
 #include "yyjson.hpp"
 #include "iceberg_types.hpp"
 
+using namespace duckdb_yyjson;
+
 namespace duckdb {
+
+// First arg is version string, arg is either empty or ".gz" if gzip
+// Allows for both "v###.gz.metadata.json" and "###.metadata.json" styles
+static string DEFAULT_TABLE_VERSION_FORMAT = "v%s%s.metadata.json,%s%s.metadata.json";
+
+static string DEFAULT_VERSION_HINT_FILE = "version-hint.text";
 
 struct IcebergColumnDefinition {
 public:
@@ -80,13 +88,14 @@ public:
 
 	IcebergSnapshot ParseSnapShot(yyjson_val *snapshot, idx_t iceberg_format_version, idx_t schema_id,
 										vector<yyjson_val *> &schemas, string metadata_compression_codec, bool skip_schema_inference);
-	string ReadMetaData(const string &path, FileSystem &fs, string GetSnapshotByTimestamp);
+	string GetMetaDataPath(const string &path, FileSystem &fs, string metadata_compression_codec, string table_version = DEFAULT_VERSION_HINT_FILE, string version_format = DEFAULT_TABLE_VERSION_FORMAT);
+	string ReadMetaData(const string &path, FileSystem &fs, string metadata_compression_codec);
 	static yyjson_val *GetSnapshots(const string &path, FileSystem &fs, string GetSnapshotByTimestamp);
 	static unique_ptr<SnapshotParseInfo> GetParseInfo(yyjson_doc &metadata_json);
 
 protected:
 	//! Internal JSON parsing functions
-	static string GetTableVersion(const string &path, FileSystem &fs);
+	static string GetTableVersion(const string &path, FileSystem &fs, string version_format);
 	static yyjson_val *FindLatestSnapshotInternal(yyjson_val *snapshots);
 	static yyjson_val *FindSnapshotByIdInternal(yyjson_val *snapshots, idx_t target_id);
 	static yyjson_val *FindSnapshotByIdTimestampInternal(yyjson_val *snapshots, timestamp_t timestamp);
@@ -94,7 +103,7 @@ protected:
 	unique_ptr<SnapshotParseInfo> GetParseInfo(const string &path, FileSystem &fs, string metadata_compression_codec);
 
 	//!Catalog functions
-	string ReadMetaDataFromAWSGlue(const string &path, FileSystem &fs, string metadata_compression_codec);
+	string GetMetaDataPathFromAWSGlue(const string &path, FileSystem &fs);
 
 };
 
